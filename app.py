@@ -246,18 +246,42 @@ def _setup_db_schema():
         _ddl(cur, "CREATE INDEX IF NOT EXISTS idx_guestbook_entries_status ON guestbook_entries(status, ts)")
 
 
-def _init_db():
-    deadline = time.time() + 60
+def _init_db(deadline_seconds: float = 60) -> bool:
+    """Set up the schema. Returns True on success, False if the DB is not
+    reachable in time.
+
+    Deliberately does NOT raise. Raising here failed FastAPI's lifespan and
+    exited the container, so a brief DNS or Postgres hiccup turned into a
+    restart loop -- the monitoring service became the first casualty of the
+    outage it exists to report. Startup now continues and _db_retry_loop keeps
+    trying in the background; DB-backed endpoints degrade until it connects.
+    """
+    deadline = time.time() + deadline_seconds
     last_exc = None
     while time.time() < deadline:
         try:
             _setup_db_schema()
-            return
+            return True
         except Exception as exc:
             last_exc = exc
             print(f"DB init waiting ({exc})", flush=True)
             time.sleep(2)
-    raise RuntimeError(f"DB init failed: {last_exc}")
+    print(f"DB unreachable, starting without it: {last_exc}", flush=True)
+    return False
+
+
+async def _db_retry_loop():
+    """Keep trying to reach the database, forever, without blocking serving."""
+    global _req_count
+    while True:
+        await asyncio.sleep(15)
+        if await asyncio.to_thread(_init_db, 5):
+            print("DB reachable; schema ready", flush=True)
+            with suppress(Exception):
+                fleet.setup_schema()
+            with suppress(Exception):
+                _req_count = await asyncio.to_thread(_db_total_requests)
+            return
 
 
 
@@ -993,10 +1017,16 @@ def _safe_photo_path(filename: str) -> Path:
 async def lifespan(app: FastAPI):
     global _req_count, _loop_task, _flush_task
 
-    _init_db()
+    # to_thread: _init_db sleeps between retries, and doing that on the event
+    # loop stalled every request -- including the liveness probe on "/".
+    db_ready = await asyncio.to_thread(_init_db, 20)
     with suppress(Exception):
         fleet.setup_schema()
-    _req_count = await asyncio.to_thread(_db_total_requests)
+    _req_count = 0
+    with suppress(Exception):
+        _req_count = await asyncio.to_thread(_db_total_requests)
+    if not db_ready:
+        asyncio.create_task(_db_retry_loop())
     _loop_task = asyncio.create_task(_loop())
     _flush_task = asyncio.create_task(_flush_loop())
     fleet_alert_task = asyncio.create_task(fleet.alert_loop())
